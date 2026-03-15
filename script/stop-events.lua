@@ -161,15 +161,12 @@ function CreateStop(entity)
     output.minable = false
     output.destructible = false -- don't bother checking if alive
 
-    -- also fix up the stop entity itself, in case someone meddled with it
-    entity.trains_limit = nil
-
     -- enable reading contents and sending signals to trains
-    local trainstop_control = assert(entity.get_or_create_control_behavior()) --[[@as LuaTrainStopControlBehavior]]
+    local trainstop_control = entity.get_or_create_control_behavior() --[[@as LuaTrainStopControlBehavior]]
+    assert(trainstop_control)
 
     trainstop_control.send_to_train = true
     trainstop_control.read_from_train = true
-    trainstop_control.trains_limit_signal = nil
 
     storage.LogisticTrainStops[entity.unit_number] = {
         entity = entity,
