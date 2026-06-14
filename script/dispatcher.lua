@@ -4,8 +4,6 @@
  * See LICENSE.md in the project directory for license information.
 --]]
 
-local util = require('util')
-
 local tools = require('script.tools')
 local schedule = require('script.schedule')
 local SurfaceInterface = require('script.surface-interface')
@@ -212,10 +210,6 @@ local function DispatcherDispatchTrains(event)
             return dispatcher.availableTrains_total_capacity, dispatcher.availableTrains_total_fluid_capacity
         end)
 
-        -- snapshot Requests_by_Stop before any ProcessRequest calls mutate it
-        if not request_index then
-            dispatcher.Pending_Requests = util.copy(dispatcher.Requests_by_Stop)
-        end
 
         -- reset on invalid index
         if request_index and not dispatcher.Requests[request_index] then
@@ -280,7 +274,7 @@ local function DispatcherApiEvents(event)
     local dispatcher_data = {
         update_interval = event.tick - storage.tick_interval_start,
         provided_by_stop = dispatcher.Provided_by_Stop,
-        requests_by_stop = dispatcher.Pending_Requests,
+        requests_by_stop = dispatcher.Requests_by_Stop,
         new_deliveries = dispatcher.new_Deliveries,
         deliveries = dispatcher.Deliveries,
         available_trains = dispatcher.availableTrains,
@@ -292,6 +286,7 @@ end
 
 ----------------------------------------------------------------------------------------
 
+---@param event EventData.on_tick
 ---@return ltn.TickState?
 local function DispatcherCleanup()
     local dispatcher = tools.getDispatcher()
@@ -299,7 +294,7 @@ local function DispatcherCleanup()
     for index, knownTrain in pairs(dispatcher.knownTrains) do
         if knownTrain.invalid_tick then
             if knownTrain.invalid_tick < game.tick then
-                dispatcher.knownTrains[index] = nil
+            dispatcher.knownTrains[index] = nil
             end
         elseif not (knownTrain.train and knownTrain.train.valid) then
             knownTrain.invalid_tick = game.tick + DEAD_TRAIN_LINGER_TIME
@@ -403,7 +398,7 @@ local function getProviders(requestStation, item, req_count, min_length, max_len
                     -- check if surface transition is possible
                     local surface_connections = SurfaceInterface.FindSurfaceConnections(surface, stop.entity.surface, force, matched_networks)
                     if surface_connections then -- for same surfaces surface_connections = {}
-                        local from_network_id_string = string.format('0x%x', bit32.band(stop.network_id))
+                            local from_network_id_string = string.format('0x%x', bit32.band(stop.network_id))
                         tools.log(5, 'GetProviders', 'found %d(%d)/%d %s at %s {%s}, priority: %s, active Deliveries: %d, min_carriages: %d, max_carriages: %d, locked Slots: %d, #surface_connections: %d', function()
                             return count, stop.providing_threshold, req_count, item, stop.entity.backer_name, from_network_id_string, stop.provider_priority, activeDeliveryCount, stop.min_carriages, stop.max_carriages, stop.locked_slots, #surface_connections
                         end)
@@ -813,7 +808,8 @@ function ProcessRequest(reqIndex, request)
         min_carriages = providerData.min_carriages
     end
 
-    dispatcher.Requests_by_Stop[toID][item] = nil -- remove before merge so it's not added twice
+    dispatcher.Pending_Requests[toID] = dispatcher.Pending_Requests[toID] or {}
+    dispatcher.Pending_Requests[toID][item] = true -- mark as pending before merge so it's not added twice
 
     ---@type ltn.ItemLoadingElement[]
     local loadingList = {
@@ -833,33 +829,36 @@ function ProcessRequest(reqIndex, request)
     -- find possible mergeable items, fluids can't be merged in a sane way
     if item_info.type == 'item' then
         for merge_item, merge_count_req in pairs(dispatcher.Requests_by_Stop[toID]) do
-            local merge_item_info = tools.parseItemIdentifier(merge_item)
-            if merge_item_info and merge_item_info.type == 'item' then
-                assert(prototypes.item[merge_item_info.name], 'item prototype undefined!', merge_item_info)
-                local merge_localname = prototypes.item[merge_item_info.name].localised_name
-                -- get current provider for requested item
-                if dispatcher.Provided[merge_item] and dispatcher.Provided[merge_item][fromID] then
-                    -- set delivery Size and stacks
-                    local merge_count_prov = dispatcher.Provided[merge_item][fromID]
-                    local merge_deliverySize = merge_count_req
-                    if merge_count_req > merge_count_prov then
-                        merge_deliverySize = merge_count_prov
+            -- only merge non-pending requests
+            if not dispatcher.Pending_Requests[toID][merge_item] then
+                local merge_item_info = tools.parseItemIdentifier(merge_item)
+                if merge_item_info and merge_item_info.type == 'item' then
+                    assert(prototypes.item[merge_item_info.name], 'item prototype undefined!', merge_item_info)
+                    local merge_localname = prototypes.item[merge_item_info.name].localised_name
+                    -- get current provider for requested item
+                    if dispatcher.Provided[merge_item] and dispatcher.Provided[merge_item][fromID] then
+                        -- set delivery Size and stacks
+                        local merge_count_prov = dispatcher.Provided[merge_item][fromID]
+                        local merge_deliverySize = merge_count_req
+                        if merge_count_req > merge_count_prov then
+                            merge_deliverySize = merge_count_prov
+                        end
+                        local merge_stacks = math.ceil(merge_deliverySize / prototypes.item[merge_item_info.name].stack_size) -- calculate amount of stacks item count will occupy
+
+                        -- add to loading list
+                        table.insert(loadingList, {
+                            item = merge_item_info,
+                            localname = merge_localname,
+                            count = merge_deliverySize,
+                            stacks = merge_stacks
+                        } --[[@as ltn.ItemLoadingElement ]])
+
+                        totalStacks = totalStacks + merge_stacks
+
+                        tools.log(5, 'ProcessRequest', 'inserted into order %s >> %s: %d %s in %d/%d stacks.', function()
+                            return from, to, merge_deliverySize, merge_item, merge_stacks, totalStacks
+                        end)
                     end
-                    local merge_stacks = math.ceil(merge_deliverySize / prototypes.item[merge_item_info.name].stack_size) -- calculate amount of stacks item count will occupy
-
-                    -- add to loading list
-                    table.insert(loadingList, {
-                        item = merge_item_info,
-                        localname = merge_localname,
-                        count = merge_deliverySize,
-                        stacks = merge_stacks
-                    } --[[@as ltn.ItemLoadingElement ]])
-
-                    totalStacks = totalStacks + merge_stacks
-
-                    tools.log(5, 'ProcessRequest', 'inserted into order %s >> %s: %d %s in %d/%d stacks.', function()
-                        return from, to, merge_deliverySize, merge_item, merge_stacks, totalStacks
-                    end)
                 end
             end
         end
@@ -891,7 +890,7 @@ function ProcessRequest(reqIndex, request)
 
         script.raise_event(on_dispatcher_no_train_found_event, data)
 
-        dispatcher.Requests_by_Stop[toID][item] = count -- add removed item back to list of requested items.
+        dispatcher.Pending_Requests[toID][item] = False -- remove failed request from pending list, as it's not being delivered.
         return nil
     end
 
@@ -913,7 +912,7 @@ function ProcessRequest(reqIndex, request)
             if not known_connections[entity_key] then
                 known_connections[entity_key] = surface_connection
                 result[#result + 1] = surface_connection
-            end
+        end
         end
 
         providerData.surface_connections = result
@@ -958,11 +957,11 @@ function ProcessRequest(reqIndex, request)
     end
 
     -- create delivery
-    if #loadingList == 1 then
+        if #loadingList == 1 then
         tools.printmsg(2, function()
             return { 'ltn-message.creating-delivery', from_gps, to_gps, loadingList[1].count, tools.prettyPrint(loadingList[1].item), tools.richTextForTrain(selectedTrain) }
         end, requestForce)
-    else
+        else
         tools.printmsg(2, function()
             return { 'ltn-message.creating-delivery-merged', from_gps, to_gps, totalStacks, tools.richTextForTrain(selectedTrain) }
         end, requestForce)
@@ -1029,9 +1028,16 @@ function ProcessRequest(reqIndex, request)
             dispatcher.Provided_by_Stop[fromID][loadingListItem] = nil
         end
 
-        -- remove Request and reset age
-        dispatcher.Requests_by_Stop[toID][loadingListItem] = nil
+        -- reset age after servicing a request to ensure round robin behavior within same priority
         dispatcher.RequestAge[loadingListItem .. ',' .. toID] = nil
+        -- clear if request fully fulfilled, else subtract Request.
+        if dispatcher.Requests_by_Stop[toID][loadingListItem] <= shipment[loadingListItem] then
+            dispatcher.Requests_by_Stop[toID][loadingListItem] = nil
+            -- can reach 0 if item is fully processed by the merge functionality, in which case, mark as pending to skip when specifically adressed.
+            dispatcher.Pending_Requests[toID][loadingListItem] = true
+        else
+            dispatcher.Requests_by_Stop[toID][loadingListItem] =  dispatcher.Requests_by_Stop[toID][loadingListItem] - shipment[loadingListItem]
+        end
 
         tools.log(5, 'ProcessRequest', '  %s, %d in %d stacks', function()
             return loadingListItem, loadingList[i].count, loadingList[i].stacks
